@@ -113,7 +113,8 @@ start(URI, Options) ->
 start(Host, Port, Path, Options) ->
   UseSSL        = proplists:get_value(ssl, Options, false),
   GenOptions    = [{timeout, 5000}],
-  ClientOptions = {Host, Port, Path, UseSSL},
+  SocketOpts    = proplists:get_value(socket_options, Options, [default]),
+  ClientOptions = {Host, Port, Path, UseSSL, SocketOpts},
   case proplists:get_value(register, Options, false) of
       false ->
         gen_fsm:start_link(?MODULE, ClientOptions, GenOptions);
@@ -260,12 +261,13 @@ on_close(Client, Callback) ->
     Host     :: string(),
     Port     :: inet:port_number(),
     Resource :: string(),
-    SSL      :: boolean()
+    SSL      :: boolean(),
+    SocketOpts :: list()
   }
   ) -> {ok, connecting, #data{}}.
-init({Host, Port, Resource, SSL}) ->
+init({Host, Port, Resource, SSL, SocketOpts}) ->
   SocketType = case SSL of true -> ssl; false -> plain end,
-  {ok, Socket}    = wsecli_socket:open(Host, Port, SocketType, self()),
+  {ok, Socket}    = wsecli_socket:open(Host, Port, SocketType, self(), SocketOpts),
   {ok, Handshake} = wsock_handshake:open(Resource, Host, Port),
   Request         = wsock_http:encode(Handshake#handshake.message),
 

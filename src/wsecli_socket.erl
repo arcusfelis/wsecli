@@ -2,7 +2,7 @@
 -module(wsecli_socket).
 -include("wsecli.hrl").
 
--export([open/4]).
+-export([open/5]).
 -export([send/2]).
 -export([close/1]).
 
@@ -27,14 +27,27 @@
   Host    :: string(),
   Port    :: inet:port_number(),
   Type    :: socket_type(),
-  Client  :: pid()
+  Client  :: pid(),
+  Opts    :: list()
   ) ->
   {ok, socket()} |
   {error, term()}.
-open(Host, Port, plain, Client) ->
-  wsecli_socket_plain:start_link(Host, Port, Client, ?DEFAULT_SOCKET_OPTIONS);
-open(Host, Port, ssl, Client) ->
-  wsecli_socket_ssl:start_link(Host, Port, Client, ?DEFAULT_SOCKET_OPTIONS).
+open(Host, Port, Type, Client, Opts) ->
+  Opts2 = substitute_default_options(Opts),
+  open_2(Host, Port, Type, Client, Opts2).
+
+open_2(Host, Port, plain, Client, Opts) ->
+  wsecli_socket_plain:start_link(Host, Port, Client, Opts);
+open_2(Host, Port, ssl, Client, Opts) ->
+  wsecli_socket_ssl:start_link(Host, Port, Client, Opts).
+
+%% You can pass `[default]' as an option list and it will be rewritten
+substitute_default_options([default|T]) ->
+  ?DEFAULT_SOCKET_OPTIONS ++ substitute_default_options(T);
+substitute_default_options([H|T]) ->
+  [H|substitute_default_options(T)];
+substitute_default_options([]) ->
+  [].
 
 -spec send(
   Data   :: iolist(),

@@ -40,7 +40,10 @@
     handshake                      :: undefined | #handshake{},
     cb = default_callbacks()       :: callbacks(),
     fragmented_message = undefined :: undefined | #message{},
-    http_fragment = undefined      :: undefined | http_fragment()
+    http_fragment = undefined      :: undefined | http_fragment(),
+    compressed,
+    inflate_state,
+    deflate_state
   }).
 
 %%========================================
@@ -120,7 +123,7 @@ start(URI, Options) ->
 start(Host, Port, Path, Options) ->
   UseSSL        = proplists:get_value(ssl, Options, false),
   GenOptions    = [{timeout, 5000}],
-  ClientOptions = {Host, Port, Path, UseSSL},
+  ClientOptions = {Host, Port, Path, UseSSL, Options},
   case proplists:get_value(register, Options, false) of
       false ->
         gen_fsm:start_link(?MODULE, ClientOptions, GenOptions);
@@ -267,13 +270,14 @@ on_close(Client, Callback) ->
     Host     :: string(),
     Port     :: inet:port_number(),
     Resource :: string(),
-    SSL      :: boolean()
+    SSL      :: boolean(),
+    Options  :: list()
   }
   ) -> {ok, connecting, #data{}}.
-init({Host, Port, Resource, SSL}) ->
+init({Host, Port, Resource, SSL, Options}) ->
   SocketType = case SSL of true -> ssl; false -> plain end,
   {ok, Socket}    = wsecli_socket:open(Host, Port, SocketType, self()),
-  {ok, Handshake} = wsock_handshake:open(Resource, Host, Port),
+  {ok, Handshake} = wsock_handshake:open(Resource, Host, Port, Options),
   Request         = wsock_http:encode(Handshake#handshake.message),
 
   wsecli_socket:send(Request, Socket),
@@ -308,9 +312,22 @@ open({on_open, Callback}, StateData) ->
   execute_callback(Callback),
   {next_state, open, StateData};
 open({send, Data, Type}, StateData) ->
-  Message = wsock_message:encode(Data, [mask, Type]),
+  {Data2, Opts} = compress_message(Data, StateData),
+  Message = wsock_message:encode(Data2, [mask, Type] ++ Opts),
   wsecli_socket:send(Message, StateData#data.socket),
   {next_state, open, StateData}.
+
+
+compress_message(Bin, #data{compressed=true, deflate_state = Deflate}) ->
+	Deflated = iolist_to_binary(zlib:deflate(Deflate, Bin, sync)),
+	DeflatedBodyLength = erlang:size(Deflated) - 4,
+    Deflated1 = case Deflated of
+        << Body:DeflatedBodyLength/binary, 0:8, 0:8, 255:8, 255:8 >> -> Body;
+        _ -> Deflated
+    end,
+    {Deflated1, [comp]};
+compress_message(Bin, #data{}) ->
+    {Bin, []}.
 
 
 %% @hidden
@@ -406,9 +423,20 @@ do_wsock_httpdecode(Data, StateData) ->
             erlang:exit(malformed_request)
     end.
 
-do_handle_response({ok, _Handshake}, StateData) ->
+do_handle_response({ok, _Handshake=#handshake{message=#http_message{headers=Headers}}}, StateData) ->
+    Compressed =
+        case proplists:get_value("Sec-Websocket-Extensions", Headers) of
+            "permessage-deflate" ++ _ ->
+                %% XXX would break with more than one extention
+                %% TODO check parameters
+                true;
+            _ ->
+                false
+        end,
     execute_callback(StateData#data.cb#callbacks.on_open),
-    {next_state, open, StateData#data{fragmented_message = undefined}};
+    StateData2 = StateData#data{fragmented_message = undefined, compressed = Compressed},
+    StateData3 = maybe_open_zlib(StateData2),
+    {next_state, open, StateData3};
 do_handle_response({error, _Error}, StateData) ->
     {stop, failed_handshake, StateData}.
 
@@ -436,12 +464,13 @@ code_change(_OldVsn, StateName, StateData, _Extra) ->
 process_messages([], StateData) ->
   StateData;
 process_messages([Message | Messages], StateData) ->
+  Data = decompress_message(Message#message.payload, StateData),
   case Message#message.type of
     text ->
-      execute_callback(fun() -> (StateData#data.cb#callbacks.on_message)(text, Message#message.payload) end),
+      execute_callback(fun() -> (StateData#data.cb#callbacks.on_message)(text, Data) end),
       process_messages(Messages, StateData);
     binary ->
-      execute_callback(fun() -> (StateData#data.cb#callbacks.on_message)(binary, Message#message.payload) end),
+      execute_callback(fun() -> (StateData#data.cb#callbacks.on_message)(binary, Data) end),
       process_messages(Messages, StateData);
     fragmented ->
       NewStateData = StateData#data{fragmented_message = Message},
@@ -458,10 +487,38 @@ default_callbacks() ->
 -spec http_fragment(binary()) -> http_fragment().
 http_fragment(Data) -> #http_fragment{data = Data}.
 
-execute_callback(F) ->
+execute_callback(F) when is_function(F) ->
     try
         F()
     catch Class:Error ->
         error_logger:error_msg("application=wsecli, issue=hook_failed, reason=~1000p:~1000p", 
                                [Class, Error])
-    end.
+    end;
+execute_callback(_F) ->
+    ok.
+
+maybe_open_zlib(StateData=#data{compressed=true}) ->
+    Inflate = zlib:open(),
+    Deflate = zlib:open(),
+	% Since we are negotiating an unconstrained deflate-frame
+	% then we must be willing to accept frames using the
+	% maximum window size which is 2^15. The negative value
+	% indicates that zlib headers are not used.
+	ok = zlib:inflateInit(Inflate, -15),
+	% Initialize the deflater with a window size of 2^15 bits and disable
+	% the zlib headers.
+	ok = zlib:deflateInit(Deflate, best_compression, deflated, -15, 8, default),
+    StateData#data{inflate_state = Inflate, deflate_state = Deflate};
+maybe_open_zlib(StateData=#data{compressed=false}) ->
+    StateData.
+
+decompress_message(Data, #data{compressed=true, inflate_state = Inflate}) ->
+    Result = zlib:inflate(Inflate, [Data, << 0:8, 0:8, 255:8, 255:8 >>]),
+    case is_list(Data) of
+        true ->
+            binary_to_list(iolist_to_binary(Result));
+        false ->
+            iolist_to_binary(Result)
+    end;
+decompress_message(Data, #data{}) ->
+    Data.
